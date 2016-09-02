@@ -12,10 +12,14 @@ use Web::Simple qw/MyApplication/;
     use Git::Repository;
     use Digest::HMAC_SHA1 qw/hmac_sha1_hex/;
     use JSON;
+    use Email::Simple;
+    use Email::Sender::Simple;
+    use Email::Sender::Transport::SMTP;
+
 
     my $config = {
         git             => '/usr/bin/git',
-        secret          => '********',
+        secret          => 'StriverConniver',
         git_work_tree   => '/home/nandan/repos/AlmostIsland',
         committer_email => 'gbhat@pobox.com',
         committer_name  => 'Gurunandan Bhat',
@@ -31,55 +35,68 @@ use Web::Simple qw/MyApplication/;
         'POST + /sync' => sub {
 
             my ($self, $env) = @_;
-            my $repo    = $self->repo($env);
+            my $log;
+            if ( $self->validate($env) ) {
+                eval {
+                    my $repo = Git::Repository->new(
+                        work_tree => $config->{git_work_tree}, {
+                            git => $config->{git},
+                            env => {
+                                GIT_COMMITTER_EMAIL => $config->{committer_email},
+                                GIT_COMMITTER_NAME  => $config->{committer_name},
+                            },
+                        });
+                    $log = $self->build($repo);
+                    1;
+                } or do {
+                    $log = $@ || 'Zombie error';
+                };
+            }
+            else {
+                $log = "Cannot match GitHub secret"
+            }
+
+            debugf($log);
+            send_email($log);
 
             return [
                 200,
                 ['Content-type' => 'text/plain'],
-                [ $repo->build ],
+                [ 1 ],
             ];
         }
     }
 
-    sub repo {
+    sub validate {
 
         my ($self, $env) = @_;
         my $req = Plack::Request->new($env);
 
-        $payload = decode_json( $req->raw_body );
-        my $digest  = $req->headers->header('X-Hub-Signature');
+        $self->{_payload} = $payload = decode_json( $req->raw_body );
         my $check   = 'sha1=' . hmac_sha1_hex($payload, 'StriverConniver');
+        my $digest  = $req->headers->header('X-Hub-Signature');
 
-        return Git::Repository->new(
-            work_tree => '/home/nandan/repos/AlmostIsland', {
-                git => '/usr/local/bin/git',
-                env => {
-                    GIT_COMMITTER_EMAIL => 'gbhat@pobox.com',
-                    GIT_COMMITTER_NAME  => 'Gurunandan Bhat',
-                },
-            }
-        );
+        return 1 if ($check eq $digest);
     }
 
     sub build {
 
-        my $self = shift;
-
-        my $head_commit = $self->repo->run('rev-parse' => 'HEAD');
+        my ($self, $repo) = @_;
+        my $head_commit = $repo->run('rev-parse' => 'HEAD');
 
         my @log;
-        if ( $head_commit ne $payload->{head_commit}{id} ) {
+        if ( $head_commit ne $self->{_payload}{head_commit}{id} ) {
 
-            @log = $self->run(reset => '--hard', 'mycopy/master');
-            push @log, ($self->run(pull => 'mycopy',  'master'));
+            @log = $repo->run(reset => '--hard', 'mycopy/master');
+            push @log, ($repo->run(pull => 'mycopy',  'master'));
 
-            my @action = `/home/nandan/repos/AICode/bin/aiweb.pl test`;
-            push @log, @action;
+            my @action = `$config->{build}`;
 
-            push @log, ($self->run(add => '.'));
-            push @log, ($self->run(commit => '-m', sprintf('Automated Build %s', scalar localtime)));
-            push @log, ($self->run(push => 'mycopy', 'master'));
-            push @log, ($self->run(push => 'origin', 'master'));
+            push @log, (@action || ($?));
+            push @log, ($repo->run(add => '.'));
+            push @log, ($repo->run(commit => '-m', sprintf('Automated Build %s', scalar localtime)));
+            push @log, ($repo->run(push => 'mycopy', 'master'));
+            push @log, ($repo->run(push => 'origin', 'master'));
         }
 
         return Dumper(\@log);
@@ -87,6 +104,27 @@ use Web::Simple qw/MyApplication/;
 
     sub send_email {
 
+        my $log = shift;
+        $email = Email::Simple->create(
+            header => [
+                From => 'bhat.gurunandan@gmail.com',
+                To => 'bhat.gurunandan@gmail.com',
+                Cc => 'rhymebawd@gmail.com',
+                Subject => sprintf('Automated Build: %s', scalar localtime),
+            ],
+            body => Dumper($log),
+        );
+        my $transport = Email::Sender::Transport::SMTP->new({
+            host => 'aspmx.l.google.com',
+            port => 25,
+        });
+
+        eval {
+            sendmail($email, {transport => $transport});
+            1;
+        } or do {
+            debugf($@ || 'Zombie Error');
+        };
     }
 
     around to_psgi_app => sub {
